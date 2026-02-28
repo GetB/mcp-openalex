@@ -40,7 +40,7 @@ class ApiKeyMiddleware:
 
 
 # Build the ASGI app stack (module-level so uvicorn can import it)
-_base_app = mcp.http_app(path="/mcp", stateless_http=True)
+_base_app = mcp.http_app(path="/mcp")
 _base_app = ApiKeyMiddleware(_base_app)
 app = CORSMiddleware(
     _base_app,
