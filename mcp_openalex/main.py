@@ -10,6 +10,7 @@ import mcp_openalex.prompts.handwerk
 
 from fastmcp.server.transforms import PromptsAsTools, ResourcesAsTools
 from mcp_openalex.context import openalex_api_key_ctx
+from starlette.middleware.cors import CORSMiddleware
 
 mcp.add_transform(PromptsAsTools(mcp))
 mcp.add_transform(ResourcesAsTools(mcp))
@@ -40,7 +41,13 @@ class ApiKeyMiddleware:
 
 # Build the ASGI app stack (module-level so uvicorn can import it)
 _base_app = mcp.http_app(path="/mcp", stateless_http=True)
-app = ApiKeyMiddleware(_base_app)
+_base_app = ApiKeyMiddleware(_base_app)
+app = CORSMiddleware(
+    _base_app,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 if __name__ == "__main__":
