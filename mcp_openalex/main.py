@@ -14,45 +14,7 @@ from mcp_openalex.context import openalex_api_key_ctx
 mcp.add_transform(PromptsAsTools(mcp))
 mcp.add_transform(ResourcesAsTools(mcp))
 
-# --- ASGI Middlewares ---
-
-class BearerAuthMiddleware:
-    """Validates Authorization: Bearer <MCP_SERVER_TOKEN>.
-    If MCP_SERVER_TOKEN is not set, auth is disabled (dev mode).
-    """
-    def __init__(self, app):
-        self.app = app
-        self.token = os.environ.get("MCP_SERVER_TOKEN")
-
-    async def __call__(self, scope, receive, send):
-        if scope["type"] not in ("http", "websocket"):
-            await self.app(scope, receive, send)
-            return
-
-        if not self.token:
-            # Dev mode: auth disabled
-            await self.app(scope, receive, send)
-            return
-
-        headers = dict(scope.get("headers", []))
-        auth = headers.get(b"authorization", b"").decode()
-        if not auth.startswith("Bearer ") or auth[len("Bearer "):] != self.token:
-            await self._reject(send)
-            return
-
-        await self.app(scope, receive, send)
-
-    async def _reject(self, send):
-        await send({
-            "type": "http.response.start",
-            "status": 401,
-            "headers": [[b"content-type", b"application/json"]],
-        })
-        await send({
-            "type": "http.response.body",
-            "body": b'{"error": "Unauthorized"}',
-        })
-
+# --- ASGI Middleware ---
 
 class ApiKeyMiddleware:
     """Reads X-OpenAlex-Api-Key header and sets openalex_api_key_ctx.
@@ -78,8 +40,7 @@ class ApiKeyMiddleware:
 
 # Build the ASGI app stack (module-level so uvicorn can import it)
 _base_app = mcp.http_app(stateless_http=True)
-_base_app = ApiKeyMiddleware(_base_app)
-app = BearerAuthMiddleware(_base_app)
+app = ApiKeyMiddleware(_base_app)
 
 
 if __name__ == "__main__":
