@@ -1,5 +1,6 @@
 import httpx
 import os
+from datetime import date
 from dotenv import load_dotenv
 from fastmcp import FastMCP, Context
 from mcp.types import Icon
@@ -7,8 +8,15 @@ from context import openalex_api_key_ctx
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Union
 
+# --- NEUE DEPENDENCY FÜR RETRIES ---
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+
 load_dotenv()
 BASE_URL = "https://api.openalex.org"
+
+# --- GLOBALER HTTP-CLIENT (Connection Pooling) ---
+# Dieser Client bleibt offen und erfindet die Verbindung nicht bei jedem Call neu.
+http_client = httpx.AsyncClient(timeout=30.0)
 
 class OpenAlexPublication(BaseModel):
     """Strukturiertes Modell für eine wissenschaftliche Publikation aus OpenAlex."""
@@ -38,8 +46,16 @@ def _base_params(extra: dict | None = None) -> dict:
         params.update(extra)
     return params
 
-async def _get(client: httpx.AsyncClient, path: str, params: dict, timeout: float = 15.0) -> dict:
-    response = await client.get(f"{BASE_URL}{path}", params=params, timeout=timeout)
+# --- RETRY-MECHANISMUS ---
+# Versucht es bis zu 3x, wartet exponentiell (2s, 4s...) und wirft den Fehler danach weiter.
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=2, max=10),
+    retry=retry_if_exception_type((httpx.RequestError, httpx.HTTPStatusError)),
+    reraise=True
+)
+async def _get(path: str, params: dict, timeout: float = 15.0) -> dict:
+    response = await http_client.get(f"{BASE_URL}{path}", params=params, timeout=timeout)
     response.raise_for_status()
     return response.json()
 
@@ -88,7 +104,7 @@ def _parse_work(item: dict) -> OpenAlexPublication:
     source = ((item.get("primary_location") or {}).get("source") or {}).get("display_name")
 
     return OpenAlexPublication(
-        id=item.get("id", "").split("/")[-1], # Nur die saubere ID behalten
+        id=item.get("id", "").split("/")[-1],
         title=item.get("display_name") or "Kein Titel verfügbar",
         authors=_fmt_authors(item.get("authorships", [])),
         publication_date=item.get("publication_date", ""),
@@ -105,7 +121,7 @@ def _parse_work(item: dict) -> OpenAlexPublication:
     name="get_rate_limit",
     description="Check the remaining API budget before making expensive calls.",
     tags=["budget", "rate limit"],
-    meta={"version": "1.0.0", "author": "Alex"},
+    meta={"version": "1.1.0", "author": "Alex"},
     icons=[Icon(src="https://files.svgcdn.io/streamline/wallet.svg", mimeType="image/svg+xml", sizes=["48x48"])]
 )
 async def get_rate_limit(ctx: Context) -> str:
@@ -120,54 +136,54 @@ async def get_rate_limit(ctx: Context) -> str:
             "Configure OPENALEX_API_KEY for budget tracking and higher limits.\n"
         )
     
-    async with httpx.AsyncClient() as client:
-        try:
-            data = await _get(client, "/rate-limit", {"api_key": api_key})
-            rl = data.get("rate_limit", {})
-            costs = rl.get("endpoint_costs_usd", {})
-            remaining = rl.get("daily_remaining_usd", 0)
-            prepaid = rl.get("prepaid_remaining_usd", 0)
-            
-            budget_ok = (remaining + prepaid) > 0.001
-            if budget_ok:
-                await ctx.info("Budget OK")
-            else:
-                await ctx.warning("Budget nearly exhausted")
+    try:
+        # Client wird jetzt global genutzt, kein 'async with' mehr nötig
+        data = await _get("/rate-limit", {"api_key": api_key})
+        rl = data.get("rate_limit", {})
+        costs = rl.get("endpoint_costs_usd", {})
+        remaining = rl.get("daily_remaining_usd", 0)
+        prepaid = rl.get("prepaid_remaining_usd", 0)
+        
+        budget_ok = (remaining + prepaid) > 0.001
+        if budget_ok:
+            await ctx.info("Budget OK")
+        else:
+            await ctx.warning("Budget nearly exhausted")
 
-            return (
-                f"Daily budget:    ${rl.get('daily_budget_usd', 0):.2f}\n"
-                f"Used today:      ${rl.get('daily_used_usd', 0):.4f}\n"
-                f"Remaining:       ${remaining:.4f}\n"
-                f"Prepaid balance: ${prepaid:.4f}\n\n"
-                f"Status: {'✓ Budget sufficient' if budget_ok else '⚠ Budget nearly exhausted'}"
-            )
-        except httpx.HTTPStatusError as e:
-            await ctx.error(f"Rate limit API error: {e.response.status_code}")
-            return _fmt_error(e)
-        except httpx.RequestError as e:
-            await ctx.error(f"Network error: {e}")
-            return f"Network error: {e}"
+        return (
+            f"Daily budget:    ${rl.get('daily_budget_usd', 0):.2f}\n"
+            f"Used today:      ${rl.get('daily_used_usd', 0):.4f}\n"
+            f"Remaining:       ${remaining:.4f}\n"
+            f"Prepaid balance: ${prepaid:.4f}\n\n"
+            f"Status: {'✓ Budget sufficient' if budget_ok else '⚠ Budget nearly exhausted'}"
+        )
+    except httpx.HTTPStatusError as e:
+        await ctx.error(f"Rate limit API error: {e.response.status_code}")
+        return _fmt_error(e)
+    except Exception as e:
+        await ctx.error(f"Network/Retry error: {e}")
+        return f"Network or repeated timeout error: {e}"
 
 @mcp.tool(
     name="search_scientific_literature",
     description="Search for academic publications, authors, and institutions.",
     tags=["search", "literature"],
-    meta={"version": "1.0.0", "author": "Alex"},
+    meta={"version": "1.1.0", "author": "Alex"},
     icons=[Icon(src="https://files.svgcdn.io/streamline/definition-search-book.svg", mimeType="image/svg+xml", sizes=["48x48"])]
 )
 async def search_scientific_literature(
     ctx: Context,
     search_keywords: List[str] = Field(..., description="Liste englischer wissenschaftlicher Suchbegriffe (z.B. 'meat processing')."),
-    start_date: str = Field(..., description="Startdatum zur zeitlichen Eingrenzung (YYYY-MM-DD), z.B. '2024-10-01'."),
+    start_date: date = Field(..., description="Startdatum zur zeitlichen Eingrenzung (YYYY-MM-DD), z.B. '2024-10-01'."),
     country_codes: Optional[List[str]] = Field(["de", "at", "ch"], description="Zweistellige ISO-Ländercodes. Leer lassen für weltweite Suche."),
     max_results: int = Field(10, description="Maximale Anzahl der Ergebnisse (max 25)."),
     sort: str = Field("cited_by_count:desc", description="Sortierkriterium"),
 ) -> Union[List[OpenAlexPublication], str]:
     """Sucht in der OpenAlex Datenbank nach aktuellen Open-Access-Publikationen."""
-    safe_start_date = start_date.replace(".", "-")
-
+    
+    # date.isoformat() generiert garantiert einen sauberen String wie "2024-10-01"
     filters = [
-        f"from_publication_date:{safe_start_date}",
+        f"from_publication_date:{start_date.isoformat()}",
         "is_oa:true",
         "has_abstract:true"
     ]
@@ -188,22 +204,21 @@ async def search_scientific_literature(
     if sort:
         params["sort"] = sort
 
-    async with httpx.AsyncClient() as client:
-        try:
-            data = await _get(client, "/works", params=params, timeout=30.0)
-            return [_parse_work(item) for item in data.get("results", [])]
-        except httpx.HTTPStatusError as e:
-            await ctx.error(f"Search API error: {e.response.status_code}")
-            return _fmt_error(e)
-        except httpx.RequestError as e:
-            await ctx.error(f"Network error: {e}")
-            return f"Network error: {e}"
+    try:
+        data = await _get("/works", params=params, timeout=30.0)
+        return [_parse_work(item) for item in data.get("results", [])]
+    except httpx.HTTPStatusError as e:
+        await ctx.error(f"Search API error: {e.response.status_code}")
+        return _fmt_error(e)
+    except Exception as e:
+        await ctx.error(f"Network/Retry error: {e}")
+        return f"Network or repeated timeout error: {e}"
 
 @mcp.tool(
     name="semantic_search_literature",
     description="Semantic search for academic publications based on concepts or full text.",
     tags=["semantic search", "literature"],
-    meta={"version": "1.0.0", "author": "Alex"},
+    meta={"version": "1.1.0", "author": "Alex"},
     icons=[Icon(src="https://files.svgcdn.io/streamline/artificial-intelligence-spark.svg", mimeType="image/svg+xml", sizes=["48x48"])]
 )
 async def semantic_search_literature(
@@ -222,28 +237,27 @@ async def semantic_search_literature(
         "select": "id,display_name,publication_year,publication_date,cited_by_count,authorships,doi,open_access,type,primary_location,abstract_inverted_index",
     })
 
-    async with httpx.AsyncClient() as client:
-        try:
-            data = await _get(client, "/find/works", params, timeout=45.0) 
-            results = data.get("results", [])
-            meta = data.get("meta", {})
-            cost = meta.get("cost_usd", 0)
+    try:
+        data = await _get("/find/works", params, timeout=45.0) 
+        results = data.get("results", [])
+        meta = data.get("meta", {})
+        cost = meta.get("cost_usd", 0)
+        
+        await ctx.info(f"Semantic search completed. Found {len(results)} matches (cost: ${cost:.4f})")
+        
+        if not results:
+            return "No conceptually similar works found for the provided query."
+        
+        return [_parse_work(item) for item in results]
             
-            await ctx.info(f"Semantic search completed. Found {len(results)} matches (cost: ${cost:.4f})")
-            
-            if not results:
-                return "No conceptually similar works found for the provided query."
-            
-            return [_parse_work(item) for item in results]
-                
-        except httpx.HTTPStatusError as e:
-            if e.response.status_code == 404:
-                await ctx.error("Semantic search endpoint (/find/works) is unavailable or deprecated.")
-                return "Error: Semantic search API unavailable. Fall back to 'search_scientific_literature'."
-            return _fmt_error(e)
-        except httpx.RequestError as e:
-            await ctx.error(f"Network error: {e}")
-            return f"Network error during semantic search: {e}"
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 404:
+            await ctx.error("Semantic search endpoint (/find/works) is unavailable or deprecated.")
+            return "Error: Semantic search API unavailable. Fall back to 'search_scientific_literature'."
+        return _fmt_error(e)
+    except Exception as e:
+        await ctx.error(f"Network/Retry error: {e}")
+        return f"Network error during semantic search: {e}"
 
 if __name__ == "__main__":
     mcp.run()
