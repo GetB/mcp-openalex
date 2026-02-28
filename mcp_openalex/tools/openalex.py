@@ -1,21 +1,19 @@
 import httpx
 import os
 from datetime import date
-from dotenv import load_dotenv
-from fastmcp import FastMCP, Context
-from mcp.types import Icon
-from context import openalex_api_key_ctx
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Union
-
-# --- NEUE DEPENDENCY FÜR RETRIES ---
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from fastmcp import Context
+from mcp.types import Icon
 
-load_dotenv()
+# Importiere die zentrale MCP-Instanz und den Context aus der eigenen App
+from mcp_openalex import mcp
+from mcp_openalex.context import openalex_api_key_ctx
+
 BASE_URL = "https://api.openalex.org"
 
-# --- GLOBALER HTTP-CLIENT (Connection Pooling) ---
-# Dieser Client bleibt offen und erfindet die Verbindung nicht bei jedem Call neu.
+# Globaler HTTP-Client für Connection Pooling
 http_client = httpx.AsyncClient(timeout=30.0)
 
 class OpenAlexPublication(BaseModel):
@@ -29,8 +27,6 @@ class OpenAlexPublication(BaseModel):
     doi: Optional[str] = None
     oa_url: Optional[str] = None
     source: Optional[str] = None
-
-mcp = FastMCP("OpenAlex MCP Server")
 
 # --- HILFSFUNKTIONEN ---
 
@@ -46,8 +42,6 @@ def _base_params(extra: dict | None = None) -> dict:
         params.update(extra)
     return params
 
-# --- RETRY-MECHANISMUS ---
-# Versucht es bis zu 3x, wartet exponentiell (2s, 4s...) und wirft den Fehler danach weiter.
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=2, max=10),
@@ -60,13 +54,9 @@ async def _get(path: str, params: dict, timeout: float = 15.0) -> dict:
     return response.json()
 
 def _decode_abstract(inverted_index: Dict[str, List[int]] | None) -> str:
-    """Wandelt den abstract_inverted_index von OpenAlex in Plaintext um."""
     if not inverted_index:
         return ""
-    max_idx = -1
-    for indices in inverted_index.values():
-        if indices:
-            max_idx = max(max_idx, max(indices))
+    max_idx = max((max(indices) for indices in inverted_index.values() if indices), default=-1)
     if max_idx == -1:
         return ""
     words = [""] * (max_idx + 1)
@@ -76,7 +66,6 @@ def _decode_abstract(inverted_index: Dict[str, List[int]] | None) -> str:
     return " ".join(words).strip()
 
 def _fmt_authors(authorships: list) -> str:
-    """Formatiert die Autorenliste für eine saubere Textausgabe."""
     names = [a.get("author", {}).get("display_name", "") for a in authorships[:3]]
     result = ", ".join(filter(None, names)) or "n/a"
     if len(authorships) > 3:
@@ -84,7 +73,6 @@ def _fmt_authors(authorships: list) -> str:
     return result
 
 def _fmt_error(e: httpx.HTTPStatusError) -> str:
-    """Formatiert HTTP-Fehler der OpenAlex API."""
     if e.response.status_code == 429:
         return "Rate limit reached. Add an OPENALEX_API_KEY for higher limits."
     if e.response.status_code in (401, 403):
@@ -96,7 +84,6 @@ def _fmt_error(e: httpx.HTTPStatusError) -> str:
     return f"OpenAlex API error: HTTP {e.response.status_code} — {detail}"
 
 def _parse_work(item: dict) -> OpenAlexPublication:
-    """Zentrales Mapping eines OpenAlex JSON-Objekts auf unser Pydantic-Modell."""
     oa_url = None
     if item.get("open_access") and item["open_access"].get("oa_url"):
         oa_url = item["open_access"]["oa_url"]
@@ -137,10 +124,8 @@ async def get_rate_limit(ctx: Context) -> str:
         )
     
     try:
-        # Client wird jetzt global genutzt, kein 'async with' mehr nötig
         data = await _get("/rate-limit", {"api_key": api_key})
         rl = data.get("rate_limit", {})
-        costs = rl.get("endpoint_costs_usd", {})
         remaining = rl.get("daily_remaining_usd", 0)
         prepaid = rl.get("prepaid_remaining_usd", 0)
         
@@ -179,9 +164,6 @@ async def search_scientific_literature(
     max_results: int = Field(10, description="Maximale Anzahl der Ergebnisse (max 25)."),
     sort: str = Field("cited_by_count:desc", description="Sortierkriterium"),
 ) -> Union[List[OpenAlexPublication], str]:
-    """Sucht in der OpenAlex Datenbank nach aktuellen Open-Access-Publikationen."""
-    
-    # date.isoformat() generiert garantiert einen sauberen String wie "2024-10-01"
     filters = [
         f"from_publication_date:{start_date.isoformat()}",
         "is_oa:true",
@@ -226,9 +208,6 @@ async def semantic_search_literature(
     query: str = Field(..., description="Vollständiger Text (z.B. Absatz, Forschungsfrage), für den ähnliche Publikationen gesucht werden."),
     max_results: int = Field(5, description="Anzahl der Ergebnisse (max 10, da sehr teuer)."),
 ) -> Union[List[OpenAlexPublication], str]:
-    """Nutzt die KI-gestützte Vektorsuche (Semantic Search) von OpenAlex.
-    ACHTUNG: Dieses Tool kostet 1.000 Credits pro Aufruf! Verwende es NUR als Fallback.
-    """
     await ctx.warning(f"Initiating EXPENSIVE semantic search for concept: '{query[:50]}...'")
 
     params = _base_params({
@@ -258,6 +237,3 @@ async def semantic_search_literature(
     except Exception as e:
         await ctx.error(f"Network/Retry error: {e}")
         return f"Network error during semantic search: {e}"
-
-if __name__ == "__main__":
-    mcp.run()

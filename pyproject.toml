@@ -1,0 +1,18 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mcp-openalex"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "fastmcp",
+    "httpx",
+    "pydantic",
+    "python-dotenv",
+    "tenacity",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["mcp_openalex"]
