@@ -12,6 +12,7 @@ dependencies = [
     "pydantic",
     "python-dotenv",
     "tenacity",
+    "uvicorn[standard]",
 ]
 
 [tool.hatch.build.targets.wheel]
